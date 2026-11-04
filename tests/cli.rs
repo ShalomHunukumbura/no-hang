@@ -1,0 +1,91 @@
+use std::process::Command;
+
+fn no_hang(args: &[&str]) -> (i32, String, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_no-hang"))
+        .args(args)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("the binary runs");
+    (
+        out.status.code().expect("exited normally"),
+        String::from_utf8(out.stdout).unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
+    )
+}
+
+#[test]
+fn text_report_on_the_fixture_app() {
+    let (code, out, _) = no_hang(&["tests/fixtures/app"]);
+    assert_eq!(code, 1);
+    let expected = "\
+tests/fixtures/app/payments.py:12:12  NH001 error  requests.post() has no timeout, so it waits forever if the server stops answering.
+tests/fixtures/app/payments.py:24:55  NH002 error  requests.get(timeout=None) turns the timeout off.
+tests/fixtures/app/payments.py:28:35  NH900 note  requests.post(**options) may set timeout inside the dictionary, so it can't be checked.
+tests/fixtures/app/payments.py:32:5  NH003 warning  subprocess.run() has no timeout, so a command that never exits blocks forever.
+Found 2 errors and 1 warning in 2 files. 1 call couldn't be checked.
+";
+    let got: String = out
+        .lines()
+        .filter(|l| !l.starts_with("    fix:"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn a_parameter_named_timeout_is_trusted() {
+    // refund() passes its own timeout argument through; its value isn't known here.
+    let (_, out, _) = no_hang(&["tests/fixtures/app/payments.py"]);
+    assert!(!out.contains(":16:"), "{out}");
+}
+
+#[test]
+fn clean_file_exits_zero() {
+    let (code, out, _) = no_hang(&["tests/fixtures/app/clean.py"]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        out,
+        "All clear: checked 1 file, no calls that can wait forever.\n"
+    );
+}
+
+#[test]
+fn warnings_fail_only_with_strict() {
+    let args = ["--ignore", "NH001,NH002", "tests/fixtures/app"];
+    assert_eq!(no_hang(&args).0, 0);
+    let strict = ["--strict", "--ignore", "NH001,NH002", "tests/fixtures/app"];
+    assert_eq!(no_hang(&strict).0, 1);
+}
+
+#[test]
+fn github_annotations() {
+    let (_, out, _) = no_hang(&["--format", "github", "tests/fixtures/app/payments.py"]);
+    let first = out.lines().next().unwrap();
+    assert!(
+        first.starts_with("::error file=tests/fixtures/app/payments.py,line=12,col=12,title=NH001 http-no-timeout::"),
+        "{first}"
+    );
+    assert!(out.contains("::notice "), "{out}");
+}
+
+#[test]
+fn json_report() {
+    let (_, out, _) = no_hang(&["--format", "json", "tests/fixtures/app/payments.py"]);
+    let rows: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 4);
+    assert_eq!(rows[0]["rule"], "NH001");
+    assert_eq!(rows[0]["severity"], "error");
+    assert_eq!(rows[0]["line"], 12);
+}
+
+#[test]
+fn explain_and_usage_errors() {
+    let (code, out, _) = no_hang(&["--explain", "nh001"]);
+    assert_eq!(code, 0);
+    assert!(out.starts_with("NH001 http-no-timeout (error)"), "{out}");
+    assert!(out.contains("How to fix it:"));
+    assert_eq!(no_hang(&["--explain", "NH999"]).0, 2);
+    assert_eq!(no_hang(&["--ignore", "NH999"]).0, 2);
+    assert_eq!(no_hang(&["does/not/exist"]).0, 2);
+    assert_eq!(no_hang(&["--format", "xml"]).0, 2);
+}

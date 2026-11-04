@@ -1,0 +1,5 @@
+/target/
+
+# The explainer stays local.
+explain.md
+explain.pdf

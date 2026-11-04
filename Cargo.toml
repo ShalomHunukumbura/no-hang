@@ -1,0 +1,24 @@
+[package]
+name = "no-hang"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Find network, database and process calls that can wait forever."
+license = "MIT"
+repository = "https://github.com/ShalomHunukumbura/no-hang"
+readme = "README.md"
+keywords = ["timeout", "linter", "reliability", "tree-sitter", "ci"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+ignore = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tree-sitter = "0.27"
+tree-sitter-python = "0.25"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
