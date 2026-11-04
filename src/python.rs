@@ -9,6 +9,7 @@
 //! `self.session.get(url)` in another method, or a parameter typed `requests.Session`.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 
 use tree_sitter::{Node, Parser};
 
@@ -138,7 +139,7 @@ struct Ctx<'a> {
     bindings: Bindings,
     /// Each node's parent. tree-sitter's `Node::parent` searches down from the root, which
     /// is slow on big files, so the parents are recorded once.
-    parents: HashMap<usize, Node<'a>>,
+    parents: Parents<'a>,
 }
 
 impl<'a> Ctx<'a> {
@@ -176,7 +177,7 @@ pub fn check(path: &str, source: &str) -> Vec<Finding> {
         root,
         imports: Imports::default(),
         bindings: Bindings::default(),
-        parents: HashMap::new(),
+        parents: Parents::default(),
     };
     let nodes = flatten(root, &mut ctx.parents);
     for node in &nodes {
@@ -195,9 +196,31 @@ pub fn check(path: &str, source: &str) -> Vec<Finding> {
         .collect()
 }
 
+/// Node ids are addresses: already unique, so a full hash is wasted work. They're aligned,
+/// so the low bits are always zero; one multiply and fold spreads them.
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("only usize keys are hashed")
+    }
+    fn write_usize(&mut self, n: usize) {
+        let h = (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = h ^ (h >> 32);
+    }
+}
+
+type Parents<'t> = HashMap<usize, Node<'t>, BuildHasherDefault<IdHasher>>;
+
 /// Every node in document order, recording each one's parent on the way.
-fn flatten<'t>(root: Node<'t>, parents: &mut HashMap<usize, Node<'t>>) -> Vec<Node<'t>> {
-    let mut nodes = Vec::new();
+fn flatten<'t>(root: Node<'t>, parents: &mut Parents<'t>) -> Vec<Node<'t>> {
+    let count = root.descendant_count();
+    parents.reserve(count);
+    let mut nodes = Vec::with_capacity(count);
     // The ancestors of the cursor's node, innermost last.
     let mut path: Vec<Node<'t>> = Vec::new();
     let mut cursor = root.walk();

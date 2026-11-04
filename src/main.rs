@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use clap::{Parser, ValueEnum};
 
@@ -86,18 +87,10 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut findings: Vec<Finding> = Vec::new();
-    for file in &files {
-        // A file that isn't UTF-8 can't be Python source we'd understand; skip it.
-        let Ok(source) = std::fs::read_to_string(file) else {
-            continue;
-        };
-        findings.extend(
-            check_file(file, &source)
-                .into_iter()
-                .filter(|f| !ignored.contains(f.rule.code)),
-        );
-    }
+    let mut findings: Vec<Finding> = check_all(&files)
+        .into_iter()
+        .filter(|f| !ignored.contains(f.rule.code))
+        .collect();
     findings.sort_by(|a, b| (&a.path, a.line, a.col).cmp(&(&b.path, b.line, b.col)));
 
     let output = match cli.format {
@@ -117,6 +110,34 @@ fn main() -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Check files on every core. Each thread takes the next unchecked file until none are left.
+fn check_all(files: &[PathBuf]) -> Vec<Finding> {
+    let next = AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(files.len().max(1));
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut found = Vec::new();
+                    while let Some(file) = files.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        // A file that isn't UTF-8 can't be source we'd understand; skip it.
+                        if let Ok(source) = std::fs::read_to_string(file) {
+                            found.extend(check_file(file, &source));
+                        }
+                    }
+                    found
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().expect("a checker thread panicked"))
+            .collect()
+    })
 }
 
 fn explain(code: &str) -> ExitCode {
