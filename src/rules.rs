@@ -43,7 +43,8 @@ pub const RULES: &[Rule] = &[
         severity: Severity::Error,
         summary: "An HTTP request is made with no timeout, so it waits forever if the server \
                   stops answering.",
-        why: "requests has no default timeout. If the server accepts the connection and then \
+        why: "requests has no default timeout, and neither does a requests.Session (setting \
+              session.timeout does nothing). If the server accepts the connection and then \
               never answers, the call blocks for as long as the process lives. In a web app \
               each stuck call holds a worker; once every worker is waiting, the whole site \
               stops responding, even for pages that never touch the slow server.",
@@ -54,11 +55,15 @@ pub const RULES: &[Rule] = &[
         code: TIMEOUT_NONE,
         name: "timeout-none",
         severity: Severity::Error,
-        summary: "timeout=None is passed, which turns the timeout off.",
+        summary: "A timeout is set to None, which turns it off.",
         why: "timeout=None means \"wait forever\", the same as leaving it out. It often comes \
-              from a settings value that was never set, or from copying a signature's default.",
+              from a settings value that was never set, or from copying a signature's default. \
+              It hides in client and timeout objects too: httpx.Client(timeout=None) turns off \
+              the 5 second default for every request the client makes, httpx.Timeout(None) \
+              sets every limit to None, and aiohttp.ClientTimeout() with no total or sock_read \
+              leaves reads unbounded, because every field defaults to None.",
         fix: "Pass a number of seconds. If the value comes from settings, give the setting a \
-              default instead of None.",
+              default instead of None. For aiohttp.ClientTimeout, set total or sock_read.",
     },
     Rule {
         code: SUBPROCESS_NO_TIMEOUT,

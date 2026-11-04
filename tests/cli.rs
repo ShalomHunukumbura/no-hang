@@ -89,3 +89,21 @@ fn explain_and_usage_errors() {
     assert_eq!(no_hang(&["does/not/exist"]).0, 2);
     assert_eq!(no_hang(&["--format", "xml"]).0, 2);
 }
+
+#[test]
+fn follows_a_session_across_methods() {
+    let (code, out, _) = no_hang(&["tests/fixtures/clients"]);
+    assert_eq!(code, 1);
+    assert!(
+        out.starts_with(
+            "tests/fixtures/clients/api.py:12:16  NH001 error  self.session.get() has no \
+             timeout, and a requests.Session has no default, so it waits forever if the server \
+             stops answering. Setting the session's .timeout does nothing in requests.\n"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.ends_with("Found 1 error and 0 warnings in 1 file.\n"),
+        "{out}"
+    );
+}
