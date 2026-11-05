@@ -66,24 +66,50 @@ and `from_url` with no `socket_timeout` (unless the URL has `?socket_timeout=`),
 with no `command_timeout`, and psycopg with no `connect_timeout`. A connection string that
 comes from settings can't be read, so those calls get a note, not an error.
 
-On 14,000 files of installed packages it takes about 6 seconds, and found real ones in
-fsspec, tqdm's Telegram and Discord notifiers, transformers, torch's Redis cache,
-setuptools, pre-commit and redis-py's own OCSP check.
+### JavaScript and TypeScript
 
-**Status: in development, not released yet.** Python works today. boto3 isn't checked
-because it already has 60 second timeouts. Coming next: ignore comments and a baseline,
-then JavaScript, TypeScript and Go, and prebuilt binaries with a GitHub Action.
+```ts
+const api = axios.create({ baseURL: API });     // NH001: axios's default timeout is 0, none
+const pool = new Pool({ connectionString });    // NH006: a full pool queues the caller forever
+const redis = new Redis(REDIS_URL);             // NH900: a URL or options it can't read
+execSync("git fetch");                          // NH003
+```
+
+axios calls and `axios.create()` without `timeout` (unless the file sets
+`defaults.timeout`), `child_process` exec and sync calls, node-postgres `Pool` and `Client`
+without `connectionTimeoutMillis`, and ioredis without `commandTimeout`. `fetch` isn't
+reported: Node's fetch has 300 second header and body timeouts. `.js`, `.mjs`, `.cjs`,
+`.jsx`, `.ts`, `.mts`, `.cts` and `.tsx` files are read; `.d.ts` files are skipped.
+
+### Go
+
+`http.Get`, `http.Post` and `http.DefaultClient`, which have no timeout; an
+`http.Client{}` without `Timeout`, unless the file builds requests with
+`http.NewRequestWithContext` or the client's Transport sets `ResponseHeaderTimeout`;
+`exec.Command` (use `exec.CommandContext`); and `database/sql` calls on a handle from
+`sql.Open` that don't take a context.
+
+### On real code
+
+On 14,000 files of installed Python packages it takes about 6 seconds, and found real ones
+in fsspec, tqdm's Telegram and Discord notifiers, transformers, torch's Redis cache,
+setuptools, pre-commit and redis-py's own OCSP check. On Go's own source (7,700 files) it
+takes 2 seconds.
+
+**Status: in development, not released yet.** Python, JavaScript, TypeScript and Go work
+today. boto3 isn't checked because it already has 60 second timeouts. Coming next:
+SQLAlchemy, ignore comments and a baseline, then prebuilt binaries with a GitHub Action.
 
 ## Rules
 
 | Code | Name | Severity | Finds |
 |---|---|---|---|
-| NH001 | http-no-timeout | error | A `requests` call, a call on a `requests.Session`, `urlopen` or an `http.client` connection with no timeout |
-| NH002 | timeout-none | error | `timeout=None`, `httpx.Timeout(None)` or an `aiohttp.ClientTimeout()` with no read limit |
-| NH003 | subprocess-no-timeout | warning | `subprocess.run`, `call`, `check_call` or `check_output` with no `timeout=` |
+| NH001 | http-no-timeout | error | Python `requests`, `urlopen` and `http.client`; axios; Go's `http.Get` and `http.Client{}`; all with no timeout |
+| NH002 | timeout-none | error | `timeout=None`, `httpx.Timeout(None)`, an `aiohttp.ClientTimeout()` with no read limit, `{ timeout: 0 }`, `http.Client{Timeout: 0}` |
+| NH003 | subprocess-no-timeout | warning | Python `subprocess`, Node `child_process` exec and sync calls, Go `exec.Command` |
 | NH004 | socket-no-timeout | error | `smtplib`, `ftplib`, `poplib`, `imaplib`, `socket.create_connection`, or a socket that connects without `settimeout()` |
-| NH005 | redis-no-timeout | error | A Redis client with no `socket_timeout` |
-| NH006 | db-no-timeout | warning | asyncpg with no `command_timeout`, psycopg with no `connect_timeout` |
+| NH005 | redis-no-timeout | error | redis-py with no `socket_timeout`, ioredis with no `commandTimeout` |
+| NH006 | db-no-timeout | warning | asyncpg, psycopg, node-postgres and Go `database/sql` with no timeout |
 | NH900 | cant-check | note | A call that passes `**kwargs`, or a connection string from settings, where a timeout may be hidden |
 
 `no-hang --explain NH001` says why a rule exists and how to fix what it finds.
@@ -97,6 +123,7 @@ no-hang --strict              # fail on warnings too
 no-hang --ignore NH003        # skip rules
 no-hang --format github       # annotations on the pull request diff
 no-hang --format json         # for other tools
+no-hang --no-ignore vendor/   # check files .gitignore leaves out
 no-hang --list-rules
 ```
 
