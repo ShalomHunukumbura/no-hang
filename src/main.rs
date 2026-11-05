@@ -6,9 +6,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use clap::{Parser, ValueEnum};
 
+use no_hang::baseline::{self, Baseline};
 use no_hang::finding::Finding;
+use no_hang::report::Summary;
 use no_hang::rules::{self, Severity, RULES};
-use no_hang::{check_file, is_supported, report};
+use no_hang::{check_file, is_supported, report, Checked};
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Format {
@@ -48,6 +50,14 @@ struct Cli {
     /// Check files that .gitignore and .ignore files leave out, like node_modules or .venv.
     #[arg(long)]
     no_ignore: bool,
+
+    /// Only report findings that aren't in this baseline file.
+    #[arg(long, value_name = "FILE")]
+    baseline: Option<PathBuf>,
+
+    /// Save every current finding to this baseline file and exit, so only new ones fail.
+    #[arg(long, value_name = "FILE", conflicts_with = "baseline")]
+    write_baseline: Option<PathBuf>,
 }
 
 const USAGE_ERROR: u8 = 2;
@@ -86,6 +96,20 @@ fn main() -> ExitCode {
         }
     }
 
+    let known = match &cli.baseline {
+        Some(path) => match std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|json| Baseline::parse(&json))
+        {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("no-hang: can't read the baseline {}: {e}", path.display());
+                return ExitCode::from(USAGE_ERROR);
+            }
+        },
+        None => None,
+    };
+
     let files = match collect_files(&cli.paths, cli.no_ignore) {
         Ok(files) => files,
         Err(message) => {
@@ -94,14 +118,47 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut findings: Vec<Finding> = check_all(&files)
+    let checked = check_all(&files);
+    let mut totals = Summary {
+        files: files.len(),
+        ignored: checked.ignored,
+        known: 0,
+    };
+    let mut findings: Vec<Finding> = checked
+        .findings
         .into_iter()
         .filter(|f| !ignored.contains(f.rule.code))
         .collect();
     findings.sort_by(|a, b| (&a.path, a.line, a.col).cmp(&(&b.path, b.line, b.col)));
 
+    if let Some(path) = &cli.write_baseline {
+        if let Err(e) = std::fs::write(path, baseline::render(&findings)) {
+            eprintln!("no-hang: can't write {}: {e}", path.display());
+            return ExitCode::from(USAGE_ERROR);
+        }
+        emit(&format!(
+            "Saved {} to {}. Pass --baseline {} to report only new ones.\n",
+            plural(findings.len(), "finding"),
+            path.display(),
+            path.display()
+        ));
+        return ExitCode::SUCCESS;
+    }
+    if let Some(known) = known {
+        let (rest, skipped, fixed) = known.filter(findings);
+        findings = rest;
+        totals.known = skipped;
+        if fixed > 0 {
+            eprintln!(
+                "no-hang: {} in the baseline no longer happen. Run --write-baseline again to \
+                 drop them.",
+                plural(fixed, "finding")
+            );
+        }
+    }
+
     let output = match cli.format {
-        Format::Text => report::text(&findings, files.len()),
+        Format::Text => report::text(&findings, &totals),
         Format::Github => report::github(&findings),
         Format::Json => report::json(&findings),
     };
@@ -120,7 +177,7 @@ fn main() -> ExitCode {
 }
 
 /// Check files on every core. Each thread takes the next unchecked file until none are left.
-fn check_all(files: &[PathBuf]) -> Vec<Finding> {
+fn check_all(files: &[PathBuf]) -> Checked {
     let next = AtomicUsize::new(0);
     let threads = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
@@ -129,21 +186,26 @@ fn check_all(files: &[PathBuf]) -> Vec<Finding> {
         let workers: Vec<_> = (0..threads)
             .map(|_| {
                 scope.spawn(|| {
-                    let mut found = Vec::new();
+                    let mut found = Checked::default();
                     while let Some(file) = files.get(next.fetch_add(1, Ordering::Relaxed)) {
                         // A file that isn't UTF-8 can't be source we'd understand; skip it.
                         if let Ok(source) = std::fs::read_to_string(file) {
-                            found.extend(check_file(file, &source));
+                            let checked = check_file(file, &source);
+                            found.findings.extend(checked.findings);
+                            found.ignored += checked.ignored;
                         }
                     }
                     found
                 })
             })
             .collect();
-        workers
-            .into_iter()
-            .flat_map(|w| w.join().expect("a checker thread panicked"))
-            .collect()
+        let mut all = Checked::default();
+        for worker in workers {
+            let found = worker.join().expect("a checker thread panicked");
+            all.findings.extend(found.findings);
+            all.ignored += found.ignored;
+        }
+        all
     })
 }
 
@@ -162,6 +224,10 @@ fn explain(code: &str) -> ExitCode {
         wrap(rule.fix)
     ));
     ExitCode::SUCCESS
+}
+
+fn plural(n: usize, word: &str) -> String {
+    format!("{n} {word}{}", if n == 1 { "" } else { "s" })
 }
 
 /// Write to stdout. A reader that stops early, like `no-hang | head`, closes the pipe; that

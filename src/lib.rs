@@ -1,11 +1,13 @@
 //! no-hang finds network, database and process calls that can wait forever.
 
+pub mod baseline;
 pub mod finding;
 pub mod go;
 pub mod javascript;
 pub mod python;
 pub mod report;
 pub mod rules;
+pub mod suppress;
 pub mod syntax;
 
 use std::path::Path;
@@ -30,15 +32,31 @@ fn language(path: &Path) -> Option<Language> {
     })
 }
 
+/// What checking one file found.
+#[derive(Default)]
+pub struct Checked {
+    pub findings: Vec<Finding>,
+    /// Findings an ignore comment in the source turned off.
+    pub ignored: usize,
+}
+
 /// Check one file, choosing the checker by its extension. Unknown extensions give nothing.
-pub fn check_file(path: &Path, source: &str) -> Vec<Finding> {
+pub fn check_file(path: &Path, source: &str) -> Checked {
     // Forward slashes on every platform, so reports and annotations read the same.
     let shown = path.to_string_lossy().replace('\\', "/");
-    match language(path) {
+    let all = match language(path) {
         Some(Language::Python) => python::check(&shown, source),
         Some(Language::Js(dialect)) => javascript::check(&shown, source, dialect),
         Some(Language::Go) => go::check(&shown, source),
         None => Vec::new(),
+    };
+    let lines: Vec<&str> = source.lines().collect();
+    let (ignored, findings): (Vec<_>, Vec<_>) = all
+        .into_iter()
+        .partition(|f| suppress::is_ignored(&lines, f));
+    Checked {
+        findings,
+        ignored: ignored.len(),
     }
 }
 

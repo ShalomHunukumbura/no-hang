@@ -142,3 +142,66 @@ fn ignored_files_need_no_ignore() {
     assert_eq!(code, 1);
     assert!(out.contains("vendored.py:2:1  NH001"), "{out}");
 }
+
+#[test]
+fn ignore_comments() {
+    let (code, out, _) = no_hang(&["tests/fixtures/ignores"]);
+    assert_eq!(code, 1);
+    let lines: Vec<&str> = out.lines().filter(|l| !l.starts_with("    fix:")).collect();
+    assert_eq!(lines.len(), 2, "{out}");
+    assert!(
+        lines[0].starts_with("tests/fixtures/ignores/jobs.py:8:1  NH001"),
+        "{out}"
+    );
+    assert_eq!(
+        lines[1],
+        "Found 1 error and 0 warnings in 1 file. 2 findings ignored by comments."
+    );
+}
+
+#[test]
+fn baseline_reports_only_new_findings() {
+    let file = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("baseline.json");
+    let file = file.to_str().unwrap();
+
+    let (code, out, _) = no_hang(&["--write-baseline", file, "tests/fixtures/app"]);
+    assert_eq!(code, 0);
+    assert!(out.starts_with("Saved 4 findings to "), "{out}");
+
+    // The same code: nothing new.
+    let (code, out, _) = no_hang(&["--baseline", file, "tests/fixtures/app"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.ends_with("4 findings already in the baseline.\n"),
+        "{out}"
+    );
+
+    // New code: only its finding is reported.
+    let (code, out, err) = no_hang(&[
+        "--baseline",
+        file,
+        "tests/fixtures/app",
+        "tests/fixtures/clients",
+    ]);
+    assert_eq!(code, 1);
+    assert!(
+        out.starts_with("tests/fixtures/clients/api.py:12:16  NH001"),
+        "{out}"
+    );
+    assert!(err.is_empty(), "{err}");
+
+    // Fixed code: the baseline says it has entries that no longer happen.
+    let (code, _, err) = no_hang(&["--baseline", file, "tests/fixtures/clients"]);
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("4 findings in the baseline no longer happen"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_broken_baseline_is_a_usage_error() {
+    let (code, _, err) = no_hang(&["--baseline", "Cargo.toml", "tests/fixtures/app"]);
+    assert_eq!(code, 2);
+    assert!(err.contains("can't read the baseline"), "{err}");
+}
