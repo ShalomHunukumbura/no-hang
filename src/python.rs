@@ -14,7 +14,8 @@ use std::hash::{BuildHasherDefault, Hasher};
 use tree_sitter::{Node, Parser};
 
 use crate::finding::Finding;
-use crate::rules::{self, CANT_CHECK, HTTP_NO_TIMEOUT, SOCKET_NO_TIMEOUT, TIMEOUT_NONE};
+use crate::rules::{CANT_CHECK, HTTP_NO_TIMEOUT, SOCKET_NO_TIMEOUT, TIMEOUT_NONE};
+use crate::syntax::{text, walk};
 
 mod libraries;
 
@@ -159,19 +160,6 @@ fn flatten<'t>(root: Node<'t>, parents: &mut Parents<'t>) -> Vec<Node<'t>> {
             path.pop();
         }
     }
-}
-
-/// Visit every node under `node`, depth first. For small subtrees like assignment targets.
-fn walk<'t>(node: Node<'t>, visit: &mut impl FnMut(Node<'t>)) {
-    visit(node);
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk(child, visit);
-    }
-}
-
-fn text<'s>(node: Node, src: &'s [u8]) -> &'s str {
-    node.utf8_text(src).unwrap_or("")
 }
 
 fn collect_import(node: Node, src: &[u8], imports: &mut Imports) {
@@ -727,14 +715,7 @@ fn check_constructor(qualified: &str, call: Node, ctx: &Ctx) -> Option<Finding> 
 }
 
 fn finding(ctx: &Ctx, node: Node, code: &'static str, message: String) -> Finding {
-    let at = node.start_position();
-    Finding {
-        path: ctx.path.to_string(),
-        line: at.row + 1,
-        col: at.column + 1,
-        rule: rules::find(code).expect("every code used here is in the catalog"),
-        message,
-    }
+    Finding::at(ctx.path, node, code, message)
 }
 
 #[cfg(test)]
