@@ -44,6 +44,10 @@ struct Cli {
     /// List every rule and exit.
     #[arg(long)]
     list_rules: bool,
+
+    /// Check files that .gitignore and .ignore files leave out, like node_modules or .venv.
+    #[arg(long)]
+    no_ignore: bool,
 }
 
 const USAGE_ERROR: u8 = 2;
@@ -82,7 +86,7 @@ fn main() -> ExitCode {
         }
     }
 
-    let files = match collect_files(&cli.paths) {
+    let files = match collect_files(&cli.paths, cli.no_ignore) {
         Ok(files) => files,
         Err(message) => {
             eprintln!("no-hang: {message}");
@@ -181,7 +185,7 @@ fn wrap(text: &str) -> String {
     lines.join("\n")
 }
 
-fn collect_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+fn collect_files(paths: &[PathBuf], no_ignore: bool) -> Result<Vec<PathBuf>, String> {
     let mut files = Vec::new();
     for path in paths {
         if !path.exists() {
@@ -194,12 +198,27 @@ fn collect_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
             }
             continue;
         }
-        for entry in ignore::WalkBuilder::new(path).build() {
+        let before = files.len();
+        let walker = ignore::WalkBuilder::new(path)
+            .git_ignore(!no_ignore)
+            .git_global(!no_ignore)
+            .git_exclude(!no_ignore)
+            .ignore(!no_ignore)
+            .parents(!no_ignore)
+            .build();
+        for entry in walker {
             let entry = entry.map_err(|e| e.to_string())?;
             let p = entry.path();
             if entry.file_type().is_some_and(|t| t.is_file()) && is_supported(p) {
                 files.push(clean(p));
             }
+        }
+        if files.len() == before && !no_ignore {
+            eprintln!(
+                "no-hang: found nothing to check in {}. If its files are gitignored, \
+                 --no-ignore checks them.",
+                path.display()
+            );
         }
     }
     files.sort();

@@ -1,0 +1,2 @@
+# no-hang skips files listed here (like .gitignore), but git still tracks them.
+vendored.py

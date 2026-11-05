@@ -131,3 +131,14 @@ fn a_reader_that_stops_early_is_not_a_crash() {
     assert!(!stderr.contains("panicked"), "{stderr}");
     assert!(status.success());
 }
+
+#[test]
+fn ignored_files_need_no_ignore() {
+    let (code, out, err) = no_hang(&["tests/fixtures/ignored"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("checked 0 files"), "{out}");
+    assert!(err.contains("--no-ignore"), "{err}");
+    let (code, out, _) = no_hang(&["--no-ignore", "tests/fixtures/ignored"]);
+    assert_eq!(code, 1);
+    assert!(out.contains("vendored.py:2:1  NH001"), "{out}");
+}
