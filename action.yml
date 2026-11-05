@@ -1,0 +1,87 @@
+name: no-hang
+description: Find network, database and process calls that can wait forever, before one takes your site down.
+author: Shalom Hunukumbura
+branding:
+  icon: clock
+  color: orange
+
+inputs:
+  args:
+    description: >
+      Paths and flags for no-hang, separated by spaces, like "src --strict" or
+      "--baseline .no-hang-baseline.json". Quotes aren't supported, so paths can't
+      contain spaces. Don't pass --format: the action picks it.
+    default: "."
+  version:
+    description: >
+      The release to use, like v0.1.0. Leave it empty to use the release matching the
+      action's own tag (uses: ShalomHunukumbura/no-hang@v0.1.0 runs v0.1.0), or the latest
+      release when the action is used from a branch.
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Download no-hang
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        ACTION_REF: ${{ github.action_ref }}
+        ACTION_REPO: ${{ github.action_repository }}
+      run: |
+        set -euo pipefail
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+          Linux-X64) target=x86_64-unknown-linux-musl ;;
+          Linux-ARM64) target=aarch64-unknown-linux-musl ;;
+          macOS-X64) target=x86_64-apple-darwin ;;
+          macOS-ARM64) target=aarch64-apple-darwin ;;
+          Windows-X64) target=x86_64-pc-windows-msvc ;;
+          *) echo "::error::no-hang has no binary for $RUNNER_OS on $RUNNER_ARCH."; exit 1 ;;
+        esac
+        if [[ "$target" == *windows* ]]; then archive="no-hang-$target.zip"; else archive="no-hang-$target.tar.gz"; fi
+
+        version="$INPUT_VERSION"
+        if [ -z "$version" ]; then
+          case "$ACTION_REF" in v[0-9]*) version="$ACTION_REF" ;; *) version=latest ;; esac
+        fi
+        repo="${ACTION_REPO:-ShalomHunukumbura/no-hang}"
+        if [ "$version" = latest ]; then
+          base="https://github.com/$repo/releases/latest/download"
+        else
+          base="https://github.com/$repo/releases/download/$version"
+        fi
+
+        dir="$RUNNER_TEMP/no-hang"
+        # Windows runners give a Windows path; Git Bash wants its own form.
+        if command -v cygpath > /dev/null; then dir=$(cygpath -u "$dir"); fi
+        mkdir -p "$dir"
+        cd "$dir"
+        echo "Downloading $base/$archive"
+        curl -fsSL --retry 3 -o "$archive" "$base/$archive"
+        curl -fsSL --retry 3 -o "$archive.sha256" "$base/$archive.sha256"
+        if command -v sha256sum > /dev/null; then
+          sha256sum -c "$archive.sha256"
+        else
+          shasum -a 256 -c "$archive.sha256"
+        fi
+        if [[ "$archive" == *.zip ]]; then 7z x -y "$archive" > /dev/null; else tar xzf "$archive"; fi
+        if command -v cygpath > /dev/null; then cygpath -w "$dir" >> "$GITHUB_PATH"; else echo "$dir" >> "$GITHUB_PATH"; fi
+
+    - name: Run no-hang
+      shell: bash
+      env:
+        INPUT_ARGS: ${{ inputs.args }}
+      run: |
+        set -uo pipefail
+        # Split the arguments on spaces, without expanding globs.
+        set -f
+        args=($INPUT_ARGS)
+        set +f
+        # The full report goes to the job summary; annotations go on the pull request diff.
+        {
+          echo '### no-hang'
+          echo '```'
+          no-hang "${args[@]}" 2>&1 || true
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+        no-hang --format github "${args[@]}"

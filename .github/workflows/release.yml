@@ -1,0 +1,130 @@
+name: Release
+
+# Pushing a tag like v0.1.0 tests, builds the binaries and publishes them as a GitHub release.
+# Running it by hand from the Actions tab builds the binaries without releasing anything,
+# to try the builds before tagging.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag matches the version in Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::The tag is $GITHUB_REF_NAME but Cargo.toml says $version."
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+
+  build:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # musl makes static Linux binaries that run on any distribution.
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    env:
+      # The tree-sitter grammars are C, compiled by the cc crate.
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          name="no-hang-$TARGET"
+          mkdir -p dist
+          cp LICENSE README.md "target/$TARGET/release/"
+          cd "target/$TARGET/release"
+          if [[ "$TARGET" == *windows* ]]; then
+            7z a "../../../dist/$name.zip" no-hang.exe LICENSE README.md
+          else
+            tar czf "../../../dist/$name.tar.gz" no-hang LICENSE README.md
+          fi
+          cd ../../../dist
+          for file in *; do
+            if command -v sha256sum > /dev/null; then
+              sha256sum "$file" > "$file.sha256"
+            else
+              shasum -a 256 "$file" > "$file.sha256"
+            fi
+          done
+          ls -l
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+  # Use the action the way a user would, against the binaries just released.
+  try-the-action:
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Findings fail the step
+        id: findings
+        continue-on-error: true
+        uses: ./
+        with:
+          version: ${{ github.ref_name }}
+          args: tests/fixtures/app
+      - name: Clean code passes
+        uses: ./
+        with:
+          version: ${{ github.ref_name }}
+          args: tests/fixtures/app/clean.py
+      - name: The findings step failed, as it should
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.findings.outcome }}
+        run: |
+          if [ "$OUTCOME" != "failure" ]; then
+            echo "::error::The fixture app has findings, but the action passed."
+            exit 1
+          fi
