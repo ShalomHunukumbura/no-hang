@@ -63,8 +63,10 @@ It covers the standard library, where everything waits forever by default: `urlo
 
 And the clients that hang a whole site when the box they talk to stalls: `redis.Redis`
 and `from_url` with no `socket_timeout` (unless the URL has `?socket_timeout=`), asyncpg
-with no `command_timeout`, and psycopg with no `connect_timeout`. A connection string that
-comes from settings can't be read, so those calls get a note, not an error.
+with no `command_timeout`, and psycopg with no `connect_timeout`. SQLAlchemy's `create_engine` is read the same way:
+the URL's scheme says which driver, and `connect_args` or the URL's query has to carry its
+timeout (the pool itself gives up after 30 seconds). A connection string that comes from
+settings can't be read, so those calls get a note, not an error.
 
 ### JavaScript and TypeScript
 
@@ -98,7 +100,7 @@ takes 2 seconds.
 
 **Status: in development, not released yet.** Python, JavaScript, TypeScript and Go work
 today. boto3 isn't checked because it already has 60 second timeouts. Coming next:
-SQLAlchemy, ignore comments and a baseline, then prebuilt binaries with a GitHub Action.
+prebuilt binaries and a GitHub Action.
 
 ## Rules
 
@@ -114,6 +116,32 @@ SQLAlchemy, ignore comments and a baseline, then prebuilt binaries with a GitHub
 
 `no-hang --explain NH001` says why a rule exists and how to fix what it finds.
 
+## Ignoring a finding
+
+Some calls are meant to wait. Say so where the call starts, with the rule and a reason:
+
+```python
+subprocess.run(["make", "release"])  # no-hang: ignore[NH003] a release build takes what it takes
+
+# no-hang: ignore[NH005] this worker blocks on BLPOP by design
+queue = redis.Redis(host="queue")
+```
+
+`//` works the same in JavaScript, TypeScript and Go. Without codes in brackets, every rule
+is ignored on that line. The summary counts what comments turned off, so nothing disappears
+silently.
+
+## Adopting it on an existing codebase
+
+```bash
+no-hang --write-baseline .no-hang-baseline.json   # save what's there today, and commit it
+no-hang --baseline .no-hang-baseline.json         # in CI: fail only on new findings
+```
+
+Findings are matched by file, rule and the call they name, not by line number, so editing
+the rest of a file doesn't bring old ones back. When one is fixed, no-hang says the baseline
+has entries that no longer happen; run `--write-baseline` again to drop them.
+
 ## Usage
 
 ```bash
@@ -124,6 +152,7 @@ no-hang --ignore NH003        # skip rules
 no-hang --format github       # annotations on the pull request diff
 no-hang --format json         # for other tools
 no-hang --no-ignore vendor/   # check files .gitignore leaves out
+no-hang --baseline FILE       # only new findings fail (see above)
 no-hang --list-rules
 ```
 
