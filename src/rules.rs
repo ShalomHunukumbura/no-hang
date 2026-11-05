@@ -21,6 +21,35 @@ impl Severity {
     }
 }
 
+/// The language a fix is written for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lang {
+    Any,
+    Python,
+    JavaScript,
+    Go,
+}
+
+impl Lang {
+    fn of(path: &str) -> Lang {
+        match path.rsplit('.').next().unwrap_or("") {
+            "py" => Lang::Python,
+            "js" | "mjs" | "cjs" | "jsx" | "ts" | "mts" | "cts" | "tsx" => Lang::JavaScript,
+            "go" => Lang::Go,
+            _ => Lang::Any,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Lang::Any => "",
+            Lang::Python => "Python",
+            Lang::JavaScript => "JavaScript and TypeScript",
+            Lang::Go => "Go",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Rule {
     pub code: &'static str,
@@ -28,7 +57,8 @@ pub struct Rule {
     pub severity: Severity,
     pub summary: &'static str,
     pub why: &'static str,
-    pub fix: &'static str,
+    /// How to fix it, per language. `--explain` shows them all; a finding shows its own.
+    pub fix: &'static [(Lang, &'static str)],
 }
 
 pub const HTTP_NO_TIMEOUT: &str = "NH001";
@@ -54,11 +84,15 @@ pub const RULES: &[Rule] = &[
               the connection and then never answers, the call blocks for as long as the process lives. In a web app \
               each stuck call holds a worker; once every worker is waiting, the whole site \
               stops responding, even for pages that never touch the slow server.",
-        fix: "Python: pass timeout=(connect, read) in seconds, e.g. timeout=(3.05, 30); the \
-              read timeout is the longest gap between bytes, not the total time. axios: pass \
-              { timeout: 10000 } in milliseconds, or set it once with axios.create or \
-              axios.defaults.timeout. Go: make an http.Client{Timeout: 10 * time.Second}, or \
-              build requests with http.NewRequestWithContext and a context.WithTimeout.",
+        fix: &[
+            (Lang::Python, "Pass timeout=(connect, read) in seconds, e.g. timeout=(3.05, 30). \
+                            The read timeout is the longest gap between bytes, not the total \
+                            time."),
+            (Lang::JavaScript, "Pass { timeout: 10000 } in milliseconds, or set it once with \
+                                axios.create({ timeout }) or axios.defaults.timeout."),
+            (Lang::Go, "Make an http.Client{Timeout: 10 * time.Second}, or build requests \
+                        with http.NewRequestWithContext and a context.WithTimeout."),
+        ],
     },
     Rule {
         code: TIMEOUT_NONE,
@@ -73,9 +107,13 @@ pub const RULES: &[Rule] = &[
               leaves reads unbounded, because every field defaults to None. In JavaScript, \
               { timeout: 0 } means no timeout for axios and child_process, and Go's \
               http.Client{Timeout: 0} is the same as leaving it out.",
-        fix: "Pass a number of seconds. If the value comes from settings, give the setting a \
-              default instead of None. For aiohttp.ClientTimeout, set total or sock_read. In \
-              JavaScript and Go, pass a number above zero.",
+        fix: &[
+            (Lang::Python, "Pass a number of seconds. If the value comes from settings, give \
+                            the setting a default instead of None. For aiohttp.ClientTimeout, \
+                            set total or sock_read."),
+            (Lang::JavaScript, "Pass a number of milliseconds above zero."),
+            (Lang::Go, "Set Timeout above zero, e.g. 10 * time.Second."),
+        ],
     },
     Rule {
         code: SUBPROCESS_NO_TIMEOUT,
@@ -89,9 +127,12 @@ pub const RULES: &[Rule] = &[
               A command that waits on the network, a lock or input never exits, and neither \
               does the caller. It's a warning, not an error, because some commands, like a \
               build, are expected to run as long as they need.",
-        fix: "Python: pass timeout= in seconds; the call raises subprocess.TimeoutExpired and \
-              kills the command when it runs out. Node: pass { timeout: 60000 } in \
-              milliseconds. Go: use exec.CommandContext with a context.WithTimeout.",
+        fix: &[
+            (Lang::Python, "Pass timeout= in seconds. The call raises \
+                            subprocess.TimeoutExpired and kills the command when it runs out."),
+            (Lang::JavaScript, "Pass { timeout: 60000 } in milliseconds."),
+            (Lang::Go, "Use exec.CommandContext with a context.WithTimeout."),
+        ],
     },
     Rule {
         code: SOCKET_NO_TIMEOUT,
@@ -105,8 +146,8 @@ pub const RULES: &[Rule] = &[
               stalls holds the request that's sending the email, often a sign-up or a \
               password reset. Calling socket.setdefaulttimeout() in the same file bounds them, \
               and no-hang takes that into account.",
-        fix: "Pass timeout= in seconds, e.g. smtplib.SMTP(host, 587, timeout=10), or call \
-              sock.settimeout(10) before connecting.",
+        fix: &[(Lang::Python, "Pass timeout= in seconds, e.g. smtplib.SMTP(host, 587, \
+                                  timeout=10), or call sock.settimeout(10) before connecting.")],
     },
     Rule {
         code: REDIS_NO_TIMEOUT,
@@ -119,9 +160,13 @@ pub const RULES: &[Rule] = &[
               default. A cache is meant to make pages faster; with no timeout, a Redis that's \
               stalled (a failover, a full disk, a long KEYS or SAVE) makes every page that \
               reads the cache hang instead of falling back.",
-        fix: "redis-py: pass socket_timeout= and socket_connect_timeout= in seconds, or add \
-              ?socket_timeout=5 to the URL. ioredis: pass { commandTimeout: 2000 }. For blocking commands like BLPOP, make \
-              socket_timeout longer than the command's own timeout, or use a separate client.",
+        fix: &[
+            (Lang::Python, "Pass socket_timeout= and socket_connect_timeout= in seconds, or \
+                            add ?socket_timeout=5 to the URL. For blocking commands like BLPOP, \
+                            make socket_timeout longer than the command's own timeout, or use \
+                            a separate client."),
+            (Lang::JavaScript, "Pass { commandTimeout: 2000 } in milliseconds."),
+        ],
     },
     Rule {
         code: DB_NO_TIMEOUT,
@@ -137,11 +182,16 @@ pub const RULES: &[Rule] = &[
               database/sql Query and Exec have no deadline. It's a \
               warning, not an error, because the database can bound queries itself with a \
               statement_timeout set on the server or the role, which the code doesn't show.",
-        fix: "asyncpg: pass command_timeout= in seconds. psycopg: pass connect_timeout= or put \
-              connect_timeout=10 in the connection string, and set statement_timeout on the \
-              server or in options='-c statement_timeout=30s'. node-postgres: pass \
-              connectionTimeoutMillis: 5000. Go: use QueryContext, ExecContext and the rest \
-              with a context.WithTimeout.",
+        fix: &[
+            (Lang::Python, "asyncpg: pass command_timeout= in seconds. psycopg: pass \
+                            connect_timeout= or put connect_timeout=10 in the connection \
+                            string, and set statement_timeout on the server or in \
+                            options='-c statement_timeout=30s'. SQLAlchemy: put the driver's \
+                            key in connect_args."),
+            (Lang::JavaScript, "Pass connectionTimeoutMillis: 5000."),
+            (Lang::Go, "Use QueryContext, ExecContext and the rest with a \
+                        context.WithTimeout."),
+        ],
     },
     Rule {
         code: CANT_CHECK,
@@ -152,11 +202,60 @@ pub const RULES: &[Rule] = &[
         why: "no-hang reads code without running it. When arguments come from a dictionary, \
               or a Redis or Postgres URL comes from settings, it can't tell whether a timeout \
               is set. It says so rather than guessing either way.",
-        fix: "Pass the timeout explicitly next to **kwargs or the URL (socket_timeout=, \
-              connect_timeout=), or make sure the dictionary or URL always has one.",
+        fix: &[(Lang::Any, "Pass the timeout explicitly next to the **kwargs, options or URL, \
+                               or make sure they always carry one.")],
     },
 ];
 
+impl Rule {
+    /// The fix for a finding in this file.
+    pub fn fix_for(&self, path: &str) -> &'static str {
+        let lang = Lang::of(path);
+        self.fix
+            .iter()
+            .find(|(l, _)| *l == lang)
+            .or_else(|| self.fix.first())
+            .map_or("", |(_, text)| text)
+    }
+
+    /// Every fix, each labelled with its language when there's more than one.
+    pub fn all_fixes(&self) -> String {
+        if let [(_, only)] = self.fix {
+            return only.to_string();
+        }
+        self.fix
+            .iter()
+            .map(|(lang, text)| format!("{}: {text}", lang.name()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 pub fn find(code: &str) -> Option<&'static Rule> {
     RULES.iter().find(|r| r.code.eq_ignore_ascii_case(code))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_finding_gets_the_fix_for_its_language() {
+        let rule = find("NH001").unwrap();
+        assert!(rule
+            .fix_for("app/pay.py")
+            .starts_with("Pass timeout=(connect, read)"));
+        assert!(rule.fix_for("web/api.tsx").contains("milliseconds"));
+        assert!(rule.fix_for("cmd/main.go").contains("http.Client{Timeout"));
+        // A rule with one fix gives it everywhere.
+        assert_eq!(
+            find("NH900").unwrap().fix_for("x.go"),
+            find("NH900").unwrap().fix[0].1
+        );
+    }
+
+    #[test]
+    fn every_rule_has_a_fix() {
+        assert!(RULES.iter().all(|r| !r.fix.is_empty()));
+    }
 }

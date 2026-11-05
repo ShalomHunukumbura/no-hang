@@ -221,7 +221,11 @@ fn explain(code: &str) -> ExitCode {
         rule.severity.as_str(),
         wrap(rule.summary),
         wrap(rule.why),
-        wrap(rule.fix)
+        rule.all_fixes()
+            .lines()
+            .map(wrap)
+            .collect::<Vec<_>>()
+            .join("\n")
     ));
     ExitCode::SUCCESS
 }

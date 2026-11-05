@@ -26,7 +26,7 @@ pub fn text(findings: &[Finding], totals: &Summary) -> String {
             f.rule.code,
             f.severity().as_str(),
             f.message,
-            f.rule.fix
+            f.rule.fix_for(&f.path)
         ));
     }
     out.push_str(&summary(findings, totals));
@@ -43,7 +43,7 @@ pub fn github(findings: &[Finding]) -> String {
             Severity::Note => "notice",
         };
         let title = format!("{} {}", f.rule.code, f.rule.name);
-        let body = format!("{} Fix: {}", f.message, f.rule.fix);
+        let body = format!("{} Fix: {}", f.message, f.rule.fix_for(&f.path));
         out.push_str(&format!(
             "::{level} file={},line={},col={},title={}::{}\n",
             escape_property(&f.path),
@@ -79,7 +79,7 @@ pub fn json(findings: &[Finding]) -> String {
             name: f.rule.name,
             severity: f.severity(),
             message: &f.message,
-            fix: f.rule.fix,
+            fix: f.rule.fix_for(&f.path),
         })
         .collect();
     serde_json::to_string_pretty(&rows).expect("findings serialize") + "\n"
