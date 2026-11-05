@@ -107,3 +107,27 @@ fn follows_a_session_across_methods() {
         "{out}"
     );
 }
+
+#[test]
+fn a_reader_that_stops_early_is_not_a_crash() {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_no-hang"))
+        .args(["--explain", "NH001"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the binary runs");
+    // Close the pipe before reading anything, like `no-hang | head -0`.
+    drop(child.stdout.take());
+    let status = child.wait().expect("it exits");
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(status.success());
+}

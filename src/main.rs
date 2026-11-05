@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -51,15 +52,17 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     if cli.list_rules {
+        let mut list = String::new();
         for r in RULES {
-            println!(
-                "{}  {:<22} {:<8} {}",
+            list.push_str(&format!(
+                "{}  {:<22} {:<8} {}\n",
                 r.code,
                 r.name,
                 r.severity.as_str(),
                 r.summary
-            );
+            ));
         }
+        emit(&list);
         return ExitCode::SUCCESS;
     }
     if let Some(code) = &cli.explain {
@@ -98,7 +101,7 @@ fn main() -> ExitCode {
         Format::Github => report::github(&findings),
         Format::Json => report::json(&findings),
     };
-    print!("{output}");
+    emit(&output);
 
     let fails = |f: &&Finding| match f.severity() {
         Severity::Error => true,
@@ -145,11 +148,22 @@ fn explain(code: &str) -> ExitCode {
         eprintln!("no-hang: unknown rule {code}. Try --list-rules.");
         return ExitCode::from(USAGE_ERROR);
     };
-    println!("{} {} ({})\n", rule.code, rule.name, rule.severity.as_str());
-    println!("{}\n", wrap(rule.summary));
-    println!("Why it matters:\n{}\n", wrap(rule.why));
-    println!("How to fix it:\n{}", wrap(rule.fix));
+    emit(&format!(
+        "{} {} ({})\n\n{}\n\nWhy it matters:\n{}\n\nHow to fix it:\n{}\n",
+        rule.code,
+        rule.name,
+        rule.severity.as_str(),
+        wrap(rule.summary),
+        wrap(rule.why),
+        wrap(rule.fix)
+    ));
     ExitCode::SUCCESS
+}
+
+/// Write to stdout. A reader that stops early, like `no-hang | head`, closes the pipe; that
+/// isn't an error worth a panic, and the exit code still reports the findings.
+fn emit(text: &str) {
+    let _ = std::io::stdout().lock().write_all(text.as_bytes());
 }
 
 /// Wrap at 80 columns with a two-space indent.
