@@ -23,7 +23,7 @@ app/payments.py:12:12  NH001 error  requests.post() has no timeout, so it waits 
 app/payments.py:24:55  NH002 error  requests.get(timeout=None) turns the timeout off.
     fix: Pass a number of seconds. If the value comes from settings, give the setting a default instead of None. For aiohttp.ClientTimeout, set total or sock_read.
 app/payments.py:28:35  NH900 note  requests.post(**options) may set timeout inside the dictionary, so it can't be checked.
-    fix: Pass timeout= explicitly next to **kwargs, or make sure the dictionary always has one.
+    fix: Pass the timeout explicitly next to the **kwargs, options or URL, or make sure they always carry one.
 app/payments.py:32:5  NH003 warning  subprocess.run() has no timeout, so a command that never exits blocks forever.
     fix: Pass timeout= in seconds. The call raises subprocess.TimeoutExpired and kills the command when it runs out.
 Found 2 errors and 1 warning in 2 files. 1 call couldn't be checked.
@@ -98,9 +98,40 @@ in fsspec, tqdm's Telegram and Discord notifiers, transformers, torch's Redis ca
 setuptools, pre-commit and redis-py's own OCSP check. On Go's own source (7,700 files) it
 takes 2 seconds.
 
-**Status: in development, not released yet.** Python, JavaScript, TypeScript and Go work
-today. boto3 isn't checked because it already has 60 second timeouts. Coming next:
-prebuilt binaries and a GitHub Action.
+boto3 isn't checked: it already has 60 second timeouts.
+
+## Install
+
+Download the binary for your system from the
+[latest release](https://github.com/ShalomHunukumbura/no-hang/releases/latest): Linux
+(x86_64 and ARM, static, any distribution), macOS (Intel and Apple Silicon) and Windows.
+Each archive has a `.sha256` next to it.
+
+```bash
+curl -fsSL https://github.com/ShalomHunukumbura/no-hang/releases/latest/download/no-hang-x86_64-unknown-linux-musl.tar.gz | tar xz
+./no-hang --version
+```
+
+Or build it with Rust: `cargo install --git https://github.com/ShalomHunukumbura/no-hang`.
+
+## GitHub Action
+
+```yaml
+name: no-hang
+on: [pull_request]
+jobs:
+  no-hang:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ShalomHunukumbura/no-hang@v0.1.0
+        with:
+          args: . --baseline .no-hang-baseline.json   # optional; the default is "."
+```
+
+Findings show up on the pull request's diff, the full report goes in the job summary, and
+errors fail the check. The action downloads the release matching its own tag and checks
+the binary's SHA-256 before running it. It works on Linux, macOS and Windows runners.
 
 ## Rules
 
