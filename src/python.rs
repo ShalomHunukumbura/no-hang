@@ -14,8 +14,8 @@ use std::hash::{BuildHasherDefault, Hasher};
 use tree_sitter::{Node, Parser};
 
 use crate::finding::Finding;
-use crate::rules::{CANT_CHECK, HTTP_NO_TIMEOUT, SOCKET_NO_TIMEOUT, TIMEOUT_NONE};
-use crate::syntax::{text, walk};
+use crate::rules::{CANT_CHECK, DB_NO_TIMEOUT, HTTP_NO_TIMEOUT, SOCKET_NO_TIMEOUT, TIMEOUT_NONE};
+use crate::syntax::{text, unquote, walk};
 
 mod libraries;
 
@@ -660,6 +660,11 @@ fn check_constructor(qualified: &str, call: Node, ctx: &Ctx) -> Option<Finding> 
     let is_none = |n: &Node| n.kind() == "none";
 
     match qualified {
+        "sqlalchemy.create_engine"
+        | "sqlalchemy.engine.create_engine"
+        | "sqlalchemy.ext.asyncio.create_async_engine" => {
+            check_engine(call, shown, &positional, &keywords, ctx)
+        }
         // aiohttp.ClientSession(timeout=None) means the 5 minute default, so only httpx here.
         "httpx.Client" | "httpx.AsyncClient" => {
             let value = keywords.get("timeout").filter(|v| is_none(v))?;
@@ -712,6 +717,85 @@ fn check_constructor(qualified: &str, call: Node, ctx: &Ctx) -> Option<Finding> 
         }
         _ => None,
     }
+}
+
+/// SQLAlchemy hands `connect_args` and the URL's query to the driver, and only the
+/// driver's timeouts are unbounded: the pool itself gives up after 30 seconds.
+/// psycopg needs `connect_timeout`, asyncpg needs `command_timeout`.
+fn check_engine(
+    call: Node,
+    shown: &str,
+    positional: &[Node],
+    keywords: &HashMap<&str, Node>,
+    ctx: &Ctx,
+) -> Option<Finding> {
+    let url = positional.first().or_else(|| keywords.get("url"))?;
+    let url_text = text(*url, ctx.src);
+    let literal = url.kind() == "string" && !url_text.contains('{');
+    // Which driver, from the URL's scheme: `postgresql+asyncpg://...`.
+    let wanted: &[&str] = if !literal {
+        &["connect_timeout", "command_timeout"]
+    } else {
+        let scheme = unquote(url_text).split("://").next().unwrap_or("");
+        if scheme.starts_with("postgresql+asyncpg") {
+            &["command_timeout"]
+        } else if scheme.starts_with("postgres") {
+            &["connect_timeout"]
+        } else {
+            // SQLite has no network; other databases aren't covered yet.
+            return None;
+        }
+    };
+    if literal && wanted.iter().any(|k| url_text.contains(&format!("{k}="))) {
+        return None;
+    }
+    if let Some(args) = keywords.get("connect_args") {
+        if args.kind() != "dictionary" {
+            return Some(finding(
+                ctx,
+                *args,
+                CANT_CHECK,
+                format!(
+                    "{shown}() gets connect_args from {}, which may set the timeout, so it \
+                     can't be checked.",
+                    text(*args, ctx.src)
+                ),
+            ));
+        }
+        let mut cursor = args.walk();
+        let has_key = args.named_children(&mut cursor).any(|pair| {
+            pair.child_by_field_name("key")
+                .is_some_and(|k| wanted.contains(&unquote(text(k, ctx.src))))
+        });
+        if has_key {
+            return None;
+        }
+    }
+    if !literal {
+        return Some(finding(
+            ctx,
+            *url,
+            CANT_CHECK,
+            format!(
+                "{shown}() takes its URL from {url_text}, so the driver and its timeout can't \
+                 be checked. Setting the timeout in connect_args makes it explicit."
+            ),
+        ));
+    }
+    let (key, consequence) = if wanted == ["command_timeout"] {
+        ("command_timeout", "a query can run forever")
+    } else {
+        (
+            "connect_timeout",
+            "connecting waits indefinitely if the database host doesn't answer",
+        )
+    };
+    Some(finding(
+        ctx,
+        call,
+        DB_NO_TIMEOUT,
+        format!("{shown}() has no {key} in connect_args or the URL, so {consequence}."),
+    ))
 }
 
 fn finding(ctx: &Ctx, node: Node, code: &'static str, message: String) -> Finding {
@@ -1073,6 +1157,27 @@ psycopg.connect(os.environ['DATABASE_URL'])
         assert_eq!(
             codes(src),
             [("NH006", 3), ("NH006", 5), ("NH006", 8), ("NH900", 9)]
+        );
+    }
+
+    #[test]
+    fn sqlalchemy_engines() {
+        let src = "\
+from sqlalchemy import create_engine
+from sqlalchemy.ext.asyncio import create_async_engine
+create_engine('postgresql+psycopg2://app@db/app')
+create_engine('postgresql://app@db/app?connect_timeout=5')
+create_engine('postgresql://app@db/app', connect_args={'connect_timeout': 5})
+create_async_engine('postgresql+asyncpg://app@db/app')
+create_async_engine('postgresql+asyncpg://app@db/app', connect_args={'command_timeout': 30})
+create_engine('sqlite:///app.db')
+create_engine(settings.DATABASE_URL)
+create_engine(settings.DATABASE_URL, connect_args={'connect_timeout': 5})
+create_engine('postgresql://db/app', connect_args=extra)
+";
+        assert_eq!(
+            codes(src),
+            [("NH006", 3), ("NH006", 6), ("NH900", 9), ("NH900", 11)]
         );
     }
 }

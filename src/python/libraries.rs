@@ -263,6 +263,7 @@ pub const MODULES: &[&str] = &[
     "redis",
     "asyncpg",
     "psycopg",
+    "sqlalchemy",
 ];
 
 /// Objects that are made in one place and make requests in another.
