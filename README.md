@@ -45,31 +45,46 @@ class Api:
         return self.session.get(BASE + path)   # NH001, and it says why .timeout didn't help
 ```
 
-That covers `with requests.Session() as s`, a parameter typed `requests.Session`, and
-`requests.Session().get(url)`. A session that mounts an adapter or wraps `request` may set
-a timeout no-hang can't see, so it's left alone. A name means one thing per function:
-`s` in a function that takes `s` as a parameter isn't the module's session.
+That covers `with requests.Session() as s` and `requests.Session().get(url)`. A session
+that mounts an adapter or wraps `request` may set a timeout no-hang can't see, so it's left
+alone, and so is one passed in as a parameter, which the caller set up (only `timeout=None`
+on it is reported). A name means one thing per function: `s` in a function that takes `s`
+as a parameter isn't the module's session.
 
 It knows which libraries are already bounded. `httpx` times out after 5 seconds and
 `aiohttp` after 5 minutes, so their plain calls aren't reported, but turning the default off
 is: `httpx.Client(timeout=None)`, `httpx.Timeout(None)`, or an `aiohttp.ClientTimeout()`
 with no `total` or `sock_read` (every field defaults to None).
 
-On 14,000 files of installed packages it takes under 4 seconds, and found real ones in
-fsspec, tqdm's Telegram and Discord notifiers, transformers and redis-py's OCSP check.
+It covers the standard library, where everything waits forever by default: `urlopen`,
+`http.client`, `smtplib`, `ftplib`, `poplib`, `imaplib`, `socket.create_connection` and a
+`socket.socket` that connects without `settimeout()`. A file that calls
+`socket.setdefaulttimeout(10)` has bounded all of them, and no-hang takes that into account.
 
-**Status: in development, not released yet.** Python `requests`, `httpx`, `aiohttp` and
-`subprocess` work today. Coming next: databases, Redis, `urllib`, `smtplib`, sockets and
-boto3, then JavaScript, TypeScript and Go, and prebuilt binaries with a GitHub Action.
+And the clients that hang a whole site when the box they talk to stalls: `redis.Redis`
+and `from_url` with no `socket_timeout` (unless the URL has `?socket_timeout=`), asyncpg
+with no `command_timeout`, and psycopg with no `connect_timeout`. A connection string that
+comes from settings can't be read, so those calls get a note, not an error.
+
+On 14,000 files of installed packages it takes about 6 seconds, and found real ones in
+fsspec, tqdm's Telegram and Discord notifiers, transformers, torch's Redis cache,
+setuptools, pre-commit and redis-py's own OCSP check.
+
+**Status: in development, not released yet.** Python works today. boto3 isn't checked
+because it already has 60 second timeouts. Coming next: ignore comments and a baseline,
+then JavaScript, TypeScript and Go, and prebuilt binaries with a GitHub Action.
 
 ## Rules
 
 | Code | Name | Severity | Finds |
 |---|---|---|---|
-| NH001 | http-no-timeout | error | A `requests` call, or a call on a `requests.Session`, with no `timeout=` |
+| NH001 | http-no-timeout | error | A `requests` call, a call on a `requests.Session`, `urlopen` or an `http.client` connection with no timeout |
 | NH002 | timeout-none | error | `timeout=None`, `httpx.Timeout(None)` or an `aiohttp.ClientTimeout()` with no read limit |
 | NH003 | subprocess-no-timeout | warning | `subprocess.run`, `call`, `check_call` or `check_output` with no `timeout=` |
-| NH900 | cant-check | note | A call that passes `**kwargs`, where a timeout may be hidden |
+| NH004 | socket-no-timeout | error | `smtplib`, `ftplib`, `poplib`, `imaplib`, `socket.create_connection`, or a socket that connects without `settimeout()` |
+| NH005 | redis-no-timeout | error | A Redis client with no `socket_timeout` |
+| NH006 | db-no-timeout | warning | asyncpg with no `command_timeout`, psycopg with no `connect_timeout` |
+| NH900 | cant-check | note | A call that passes `**kwargs`, or a connection string from settings, where a timeout may be hidden |
 
 `no-hang --explain NH001` says why a rule exists and how to fix what it finds.
 
