@@ -14,99 +14,13 @@ use std::hash::{BuildHasherDefault, Hasher};
 use tree_sitter::{Node, Parser};
 
 use crate::finding::Finding;
-use crate::rules::{self, CANT_CHECK, HTTP_NO_TIMEOUT, SUBPROCESS_NO_TIMEOUT, TIMEOUT_NONE};
+use crate::rules::{self, CANT_CHECK, HTTP_NO_TIMEOUT, SOCKET_NO_TIMEOUT, TIMEOUT_NONE};
 
-const HTTP_VERBS: &[&str] = &[
-    "get", "post", "put", "patch", "delete", "head", "options", "request",
-];
+mod libraries;
 
-/// A module-level function that blocks, and the keyword argument that bounds it.
-struct Function {
-    module: &'static str,
-    functions: &'static [&'static str],
-    param: &'static str,
-    /// The rule for leaving the timeout out, or None when the library has a default
-    /// (then only an explicit `timeout=None` is a finding).
-    missing: Option<&'static str>,
-}
-
-/// What each library does when no timeout is passed is the knowledge these tables hold.
-const FUNCTIONS: &[Function] = &[
-    Function {
-        module: "requests",
-        functions: HTTP_VERBS,
-        param: "timeout",
-        missing: Some(HTTP_NO_TIMEOUT),
-    },
-    Function {
-        module: "subprocess",
-        functions: &["run", "call", "check_call", "check_output"],
-        param: "timeout",
-        missing: Some(SUBPROCESS_NO_TIMEOUT),
-    },
-    // httpx times out after 5 seconds unless told otherwise.
-    Function {
-        module: "httpx",
-        functions: &[
-            "get", "post", "put", "patch", "delete", "head", "options", "request", "stream",
-        ],
-        param: "timeout",
-        missing: None,
-    },
-    // aiohttp.request uses the 5 minute session default.
-    Function {
-        module: "aiohttp",
-        functions: &["request"],
-        param: "timeout",
-        missing: None,
-    },
-];
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Library {
-    Requests,
-    Httpx,
-    Aiohttp,
-}
-
-impl Library {
-    fn methods(self) -> &'static [&'static str] {
-        match self {
-            Library::Requests => HTTP_VERBS,
-            Library::Httpx => &[
-                "get", "post", "put", "patch", "delete", "head", "options", "request", "stream",
-            ],
-            Library::Aiohttp => &[
-                "get",
-                "post",
-                "put",
-                "patch",
-                "delete",
-                "head",
-                "options",
-                "request",
-                "ws_connect",
-            ],
-        }
-    }
-}
-
-/// Classes whose instances make requests.
-const CLIENTS: &[(&str, Library)] = &[
-    ("requests.Session", Library::Requests),
-    ("requests.session", Library::Requests),
-    ("requests.sessions.Session", Library::Requests),
-    ("httpx.Client", Library::Httpx),
-    ("httpx.AsyncClient", Library::Httpx),
-    ("aiohttp.ClientSession", Library::Aiohttp),
-];
-
-fn client_class(qualified: &str) -> Option<Library> {
-    CLIENTS
-        .iter()
-        .find(|(name, _)| *name == qualified)
-        .map(|(_, lib)| *lib)
-}
+use libraries::{
+    client_class, customising, function_for, replaces_sending, Library, Spec, MODULES,
+};
 
 /// Names a file binds by importing.
 #[derive(Default, Debug)]
@@ -129,6 +43,11 @@ struct Bindings {
     customised: HashSet<Key>,
     /// Sessions with `s.timeout = ...`, which requests ignores.
     timeout_attr: HashSet<Key>,
+    /// Parameters typed as a client. It was set up by the caller, maybe with an adapter or
+    /// settimeout(), so only an explicit `timeout=None` on it is a finding.
+    received: HashSet<Key>,
+    /// `socket.setdefaulttimeout(n)` is called, which bounds the standard library's clients.
+    default_timeout: bool,
 }
 
 struct Ctx<'a> {
@@ -152,10 +71,6 @@ impl<'a> Ctx<'a> {
         std::iter::successors(self.parent(node), |n| self.parent(*n))
     }
 }
-
-/// Every finding needs one of these modules imported, so a file that never mentions any of
-/// them is skipped without parsing it. Most files in a big project are.
-const MODULES: &[&str] = &["requests", "subprocess", "httpx", "aiohttp"];
 
 pub fn check(path: &str, source: &str) -> Vec<Finding> {
     if !MODULES.iter().any(|m| source.contains(m)) {
@@ -349,7 +264,13 @@ fn constructs(expr: Node, ctx: &Ctx) -> Option<Library> {
         return None;
     }
     let qualified = resolve(expr.child_by_field_name("function")?, ctx.src, &ctx.imports)?;
-    client_class(&qualified)
+    let lib = client_class(&qualified)?;
+    // Connecting a UDP socket only records the address; it never waits.
+    let arguments = expr.child_by_field_name("arguments")?;
+    if lib == Library::Socket && text(arguments, ctx.src).contains("SOCK_DGRAM") {
+        return None;
+    }
+    Some(lib)
 }
 
 /// The scope a name lives in: the innermost function, or the module.
@@ -419,7 +340,7 @@ fn collect_binding(node: Node, ctx: &Ctx, b: &mut Bindings) {
                                 Some("timeout") => {
                                     b.timeout_attr.insert(key);
                                 }
-                                Some(a) if HTTP_VERBS.contains(&a) || a == "send" => {
+                                Some(a) if replaces_sending(a) => {
                                     b.customised.insert(key);
                                 }
                                 _ => {}
@@ -475,11 +396,11 @@ fn collect_binding(node: Node, ctx: &Ctx, b: &mut Bindings) {
                     .and_then(|t| t.named_child(0))
                     .and_then(|t| resolve(t, ctx.src, &ctx.imports))
                     .and_then(|q| client_class(&q));
-                let scope = param_scope(node, ctx);
-                b.values
-                    .entry((scope, text(name, ctx.src).to_string()))
-                    .or_default()
-                    .push(value);
+                let key = (param_scope(node, ctx), text(name, ctx.src).to_string());
+                if value.is_some() {
+                    b.received.insert(key.clone());
+                }
+                b.values.entry(key).or_default().push(value);
             }
         }
         "call" => {
@@ -490,10 +411,21 @@ fn collect_binding(node: Node, ctx: &Ctx, b: &mut Bindings) {
             if function.kind() != "attribute" {
                 return;
             }
+            if resolve(function, ctx.src, &ctx.imports).as_deref()
+                == Some("socket.setdefaulttimeout")
+            {
+                let first = node
+                    .child_by_field_name("arguments")
+                    .and_then(|a| a.named_child(0));
+                if first.is_some_and(|v| v.kind() != "none") {
+                    b.default_timeout = true;
+                }
+                return;
+            }
             let method = function
                 .child_by_field_name("attribute")
                 .map(|a| text(a, ctx.src));
-            if method == Some("mount") {
+            if method.is_some_and(customising) {
                 if let Some(key) = function
                     .child_by_field_name("object")
                     .and_then(|o| key_of(o, ctx))
@@ -551,26 +483,15 @@ fn lookup_name(expr: Node, name: &str, ctx: &Ctx) -> Option<Key> {
 
 fn check_call(call: Node, ctx: &Ctx) -> Option<Finding> {
     let function = call.child_by_field_name("function")?;
-    let arguments = call.child_by_field_name("arguments")?;
     let shown = text(function, ctx.src);
 
     if let Some(qualified) = resolve(function, ctx.src, &ctx.imports) {
         if let Some(f) = function_for(&qualified) {
-            let message = match f.missing {
-                Some(SUBPROCESS_NO_TIMEOUT) => format!(
-                    "{shown}() has no timeout, so a command that never exits blocks forever."
-                ),
-                _ => format!(
-                    "{shown}() has no timeout, so it waits forever if the server stops answering."
-                ),
-            };
-            return check_arguments(
-                arguments,
-                f.param,
-                f.missing.map(|r| (r, call, message)),
-                ctx,
-                shown,
-            );
+            let missing = f.missing.map(|rule| {
+                let message = format!("{shown}() has no {}, so {}.", f.spec.param, f.consequence);
+                (rule, message)
+            });
+            return check_arguments(call, &f.spec, missing, ctx);
         }
         return check_constructor(&qualified, call, ctx);
     }
@@ -584,60 +505,120 @@ fn check_call(call: Node, ctx: &Ctx) -> Option<Finding> {
     if !lib.methods().contains(&method) {
         return None;
     }
-    let missing = (lib == Library::Requests).then(|| {
-        let mut message = format!(
-            "{shown}() has no timeout, and a requests.Session has no default, so it waits \
-             forever if the server stops answering."
-        );
-        if key.is_some_and(|k| ctx.bindings.timeout_attr.contains(&k)) {
-            message.push_str(" Setting the session's .timeout does nothing in requests.");
+    let missing = match lib {
+        Library::Requests => {
+            let mut message = format!(
+                "{shown}() has no timeout, and a requests.Session has no default, so it waits \
+                 forever if the server stops answering."
+            );
+            if key
+                .as_ref()
+                .is_some_and(|k| ctx.bindings.timeout_attr.contains(k))
+            {
+                message.push_str(" Setting the session's .timeout does nothing in requests.");
+            }
+            Some((HTTP_NO_TIMEOUT, message))
         }
-        (HTTP_NO_TIMEOUT, call, message)
+        Library::Opener => Some((
+            HTTP_NO_TIMEOUT,
+            format!("{shown}() has no timeout, so it waits forever if the server stops answering."),
+        )),
+        // A socket with settimeout() is left out by client_of, like a mounted session.
+        Library::Socket => Some((
+            SOCKET_NO_TIMEOUT,
+            format!(
+                "{shown}() on a socket with no settimeout() waits forever if the server \
+                 doesn't answer."
+            ),
+        )),
+        Library::Httpx | Library::Aiohttp => None,
+    };
+    let missing = missing.filter(|_| {
+        !key.as_ref()
+            .is_some_and(|k| ctx.bindings.received.contains(k))
     });
-    check_arguments(arguments, "timeout", missing, ctx, shown)
+    check_arguments(call, &lib.spec(), missing, ctx)
 }
 
-fn function_for(qualified: &str) -> Option<&'static Function> {
-    let (module, function) = qualified.rsplit_once('.')?;
-    FUNCTIONS
-        .iter()
-        .find(|f| f.module == module && f.functions.contains(&function))
-}
-
-/// Check the timeout argument of a call. `missing` is the finding to give when there's
-/// none, for libraries with no default.
+/// Check how a call's timeout is set. `missing` is the finding to give when it isn't, for
+/// libraries with no default.
 fn check_arguments(
-    arguments: Node,
-    param: &str,
-    missing: Option<(&'static str, Node, String)>,
+    call: Node,
+    spec: &Spec,
+    missing: Option<(&'static str, String)>,
     ctx: &Ctx,
-    shown: &str,
 ) -> Option<Finding> {
-    let mut splat = None;
+    let shown = text(call.child_by_field_name("function")?, ctx.src);
+    let arguments = call.child_by_field_name("arguments")?;
+    let param = spec.param;
+    let mut positional = Vec::new();
+    let mut keywords = HashMap::new();
+    let mut dict_splat = None;
+    let mut list_splat = None;
     let mut cursor = arguments.walk();
     for arg in arguments.named_children(&mut cursor) {
         match arg.kind() {
             "keyword_argument" => {
-                if keyword(arg, ctx) == Some(param) {
-                    let value = arg.child_by_field_name("value")?;
-                    if value.kind() == "none" {
-                        return Some(finding(
-                            ctx,
-                            value,
-                            TIMEOUT_NONE,
-                            format!("{shown}({param}=None) turns the timeout off."),
-                        ));
-                    }
-                    return None;
+                if let (Some(name), Some(value)) =
+                    (keyword(arg, ctx), arg.child_by_field_name("value"))
+                {
+                    keywords.insert(name, value);
                 }
             }
-            "dictionary_splat" => splat = Some(arg),
-            _ => {}
+            "dictionary_splat" => dict_splat = Some(arg),
+            "list_splat" => list_splat = Some(arg),
+            "comment" => {}
+            _ => positional.push(arg),
         }
     }
 
-    let (rule, node, message) = missing?;
-    if let Some(splat) = splat {
+    let given = keywords
+        .get(param)
+        .or_else(|| spec.position.and_then(|p| positional.get(p)));
+    if let Some(value) = given {
+        if value.kind() == "none" {
+            return Some(finding(
+                ctx,
+                *value,
+                TIMEOUT_NONE,
+                format!("{shown}({param}=None) turns the timeout off."),
+            ));
+        }
+        return None;
+    }
+    if spec.delegated.iter().any(|k| keywords.contains_key(k)) {
+        return None;
+    }
+    let (rule, message) = missing?;
+    if spec.global_default && ctx.bindings.default_timeout {
+        return None;
+    }
+
+    // `redis.from_url("redis://host?socket_timeout=5")` or `connect("... connect_timeout=5")`.
+    if let Some(url_keyword) = spec.url {
+        if let Some(url) = keywords.get(url_keyword).or(positional.first()) {
+            let literal = matches!(url.kind(), "string" | "concatenated_string");
+            let mut interpolated = false;
+            walk(*url, &mut |n| interpolated |= n.kind() == "interpolation");
+            if literal && text(*url, ctx.src).contains(&format!("{param}=")) {
+                return None;
+            }
+            if !literal || interpolated {
+                return Some(finding(
+                    ctx,
+                    *url,
+                    CANT_CHECK,
+                    format!(
+                        "{shown}() takes its settings from {}, which may set {param}, so it \
+                         can't be checked.",
+                        text(*url, ctx.src)
+                    ),
+                ));
+            }
+        }
+    }
+
+    if let Some(splat) = dict_splat {
         return Some(finding(
             ctx,
             splat,
@@ -648,7 +629,18 @@ fn check_arguments(
             ),
         ));
     }
-    Some(finding(ctx, node, rule, message))
+    if let (Some(splat), Some(_)) = (list_splat, spec.position) {
+        return Some(finding(
+            ctx,
+            splat,
+            CANT_CHECK,
+            format!(
+                "{shown}({}) may pass {param} by position, so it can't be checked.",
+                text(splat, ctx.src)
+            ),
+        ));
+    }
+    Some(finding(ctx, call, rule, message))
 }
 
 fn keyword<'s>(arg: Node, ctx: &Ctx<'s>) -> Option<&'s str> {
@@ -877,9 +869,11 @@ class Other:
 import requests
 def fetch(session: requests.Session, other, url):
     session.get(url)
-    other.get(url)
+    session.get(url, timeout=None)
+    other.get(url, timeout=None)
 ";
-        assert_eq!(codes(src), [("NH001", 3)]);
+        // The caller may have mounted a timeout adapter, so only timeout=None counts.
+        assert_eq!(codes(src), [("NH002", 4)]);
     }
 
     #[test]
@@ -972,5 +966,132 @@ async def main():
     aiohttp.ClientTimeout(60)
 ";
         assert_eq!(codes(src), [("NH002", 5), ("NH002", 6), ("NH002", 7)]);
+    }
+
+    #[test]
+    fn urllib_and_http_client() {
+        let src = "\
+import urllib.request
+from http.client import HTTPSConnection
+urllib.request.urlopen(url)
+urllib.request.urlopen(url, None, 10)
+urllib.request.urlopen(url, timeout=None)
+HTTPSConnection(host)
+opener = urllib.request.build_opener(handler)
+opener.open(url)
+opener.open(url, timeout=5)
+";
+        assert_eq!(
+            codes(src),
+            [("NH001", 3), ("NH002", 5), ("NH001", 6), ("NH001", 8)]
+        );
+    }
+
+    #[test]
+    fn mail_ftp_and_sockets() {
+        let src = "\
+import smtplib, ftplib, socket
+smtplib.SMTP(host, 587)
+smtplib.SMTP(host, 587, None, 10)
+smtplib.SMTP_SSL(host, 465, timeout=10)
+ftplib.FTP(host)
+socket.create_connection((host, 80))
+socket.create_connection((host, 80), 5)
+s = socket.socket()
+s.connect((host, 80))
+t = socket.socket()
+t.settimeout(5)
+t.connect((host, 80))
+";
+        assert_eq!(
+            codes(src),
+            [("NH004", 2), ("NH004", 5), ("NH004", 6), ("NH004", 9)]
+        );
+    }
+
+    #[test]
+    fn a_socket_passed_in_was_set_up_by_the_caller() {
+        let src = "import socket\ndef f(raw: socket.socket):\n    raw.connect(path)\n";
+        assert!(codes(src).is_empty());
+    }
+
+    #[test]
+    fn a_udp_socket_never_waits_to_connect() {
+        let src = "import socket\ns = socket.socket(type=socket.SOCK_DGRAM)\ns.connect(addr)\n";
+        assert!(codes(src).is_empty());
+    }
+
+    #[test]
+    fn a_listening_socket_is_fine() {
+        let src = "import socket\ns = socket.socket()\ns.bind(addr)\ns.listen()\ns.accept()\n";
+        assert!(codes(src).is_empty());
+    }
+
+    #[test]
+    fn setdefaulttimeout_bounds_the_standard_library() {
+        let src = "\
+import socket, smtplib, urllib.request
+socket.setdefaulttimeout(10)
+smtplib.SMTP(host)
+urllib.request.urlopen(url)
+";
+        assert!(codes(src).is_empty());
+        let off = "import socket, smtplib\nsocket.setdefaulttimeout(None)\nsmtplib.SMTP(h)\n";
+        assert_eq!(codes(off), [("NH004", 3)]);
+    }
+
+    #[test]
+    fn positional_splat_cant_be_checked() {
+        assert_eq!(
+            codes("import urllib.request\nurllib.request.urlopen(*args)\n"),
+            [("NH900", 2)]
+        );
+    }
+
+    #[test]
+    fn redis() {
+        let src = "\
+import redis
+from redis.asyncio import Redis as AsyncRedis
+redis.Redis(host='cache')
+redis.Redis(host='cache', socket_timeout=2)
+redis.Redis(connection_pool=pool)
+redis.Redis(socket_timeout=None)
+AsyncRedis()
+redis.from_url('redis://cache:6379/0')
+redis.from_url('redis://cache:6379/0?socket_timeout=2')
+redis.Redis.from_url(settings.REDIS_URL)
+redis.from_url(f'redis://{host}')
+";
+        assert_eq!(
+            codes(src),
+            [
+                ("NH005", 3),
+                ("NH002", 6),
+                ("NH005", 7),
+                ("NH005", 8),
+                ("NH900", 10),
+                ("NH900", 11)
+            ]
+        );
+    }
+
+    #[test]
+    fn databases() {
+        let src = "\
+import asyncpg, psycopg2, psycopg
+async def main():
+    await asyncpg.connect(dsn)
+    await asyncpg.create_pool(dsn, command_timeout=30)
+psycopg2.connect(host='db', dbname='app')
+psycopg2.connect(host='db', connect_timeout=5)
+psycopg2.connect('dbname=app connect_timeout=5')
+psycopg2.connect('dbname=app')
+psycopg.connect(os.environ['DATABASE_URL'])
+";
+        assert_eq!(
+            codes(src),
+            [("NH006", 3), ("NH006", 5), ("NH006", 8), ("NH900", 9)]
+        );
     }
 }
